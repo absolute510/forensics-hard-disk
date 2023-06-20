@@ -16,7 +16,7 @@ file_patterns = {
     "png": {
         "patterns": [
             {
-            "start": b'\x50\x4e\x47',
+            "start": b'\x89\x50\x4e\x47',
             "end": b'\xff\xfc\xfd\xfe',
             }
         ],
@@ -25,7 +25,7 @@ file_patterns = {
     "pdf": {
         "patterns": [
             {
-            "start": b'\x25\x50\x44\x46\x2d\x31',
+            "start": b'\x25\x50\x44\x46\x2d\x31\x2e\x34',
             "end": b'\x25\x25\x45\x4f\x46\x0d',
             }
         ],
