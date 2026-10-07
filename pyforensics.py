@@ -1,5 +1,6 @@
 #!/usr/bin/python
 import argparse
+import re
 import subprocess
 import os
 
@@ -175,7 +176,10 @@ parser.add_argument(
         help='Inodes for quick recovery. Ex: 12341:file1.doc,12342:file2.pdf')
 parser.add_argument(
     '-f', '--file_types', type=str, nargs='?', dest='file_types', default='jpg',
-    help=('File types for deep recovery to scan separated by comma. Ex: jpg,png,exe. [default=jpg]'),
+    help=('File types to scan for, separated by comma. Ex: jpg,png,exe. [default=jpg]\n'
+          'Used by deep recovery (dr), and as a fallback hint for quick\n'
+          'recovery (qr) when icat returns no data and the output filename\n'
+          'has no recognized extension.'),
 )
 parser.add_argument(
     '-o', '--output_path', type=str, nargs='?', dest='output_path', default='recovered',
@@ -205,7 +209,7 @@ def max_pattern_len(file_types, key):
     )
 
 
-def deep_recover(device, output_path, file_types):
+def deep_recover(device, output_path, file_types, start_offset=0, end_offset=None, name_prefix=''):
     # FIX: original find_pattern() re-scanned ALL requested file_types for a
     # START pattern on every single iteration, even while a file was already
     # being recovered. A JPEG's own embedded EXIF thumbnail re-triggers the
@@ -214,7 +218,29 @@ def deep_recover(device, output_path, file_types):
     # the output (data loss). Below, once recovering=True we only ever search
     # for the current file's END pattern - start patterns are never looked at
     # again until the current file is closed, so there is no such gap.
+    #
+    # start_offset/end_offset let a caller confine the scan to a byte range
+    # instead of the whole device - used by quick_recover()'s scoped-carve
+    # fallback so it only scans the inode's own block group rather than the
+    # entire disk. name_prefix keeps those scoped recoveries from colliding
+    # with/overwriting file names from a previous dr/qr run in the same
+    # output directory.
     raw_device_read = open(device, "rb")
+    if start_offset:
+        raw_device_read.seek(start_offset)
+    position = start_offset
+
+    def read_chunk():
+        nonlocal position
+        to_read = READ_SIZE
+        if end_offset is not None:
+            remaining = end_offset - position
+            if remaining <= 0:
+                return b""
+            to_read = min(to_read, remaining)
+        data = raw_device_read.read(to_read)
+        position += len(data)
+        return data
 
     start_reserve = max(max_pattern_len(file_types, 'start') - 1, 0)
 
@@ -230,7 +256,7 @@ def deep_recover(device, output_path, file_types):
     print("Scanning...")
     try:
         while True:
-            chunk = raw_device_read.read(READ_SIZE)
+            chunk = read_chunk()
             buffer += chunk
 
             progressed = True
@@ -246,7 +272,7 @@ def deep_recover(device, output_path, file_types):
                         current_pattern = pattern
                         max_size = file_patterns[file_type]['max_size']
                         recovered_file = open(
-                            os.path.join(output_path, str(recovered_file_id) + '.' + file_type), 'wb'
+                            os.path.join(output_path, name_prefix + str(recovered_file_id) + '.' + file_type), 'wb'
                         )
                         # FIX: doc/xls/psd define identical start and end
                         # byte patterns in file_patterns above. We write the
@@ -274,7 +300,7 @@ def deep_recover(device, output_path, file_types):
                         recovered_file.write(buffer[:cut])
                         written += cut
                         print('Wrote file: ' + os.path.join(
-                            output_path, str(recovered_file_id) + '.' + current_type))
+                            output_path, name_prefix + str(recovered_file_id) + '.' + current_type))
                         recovered_file.close()
                         recovered_file = None
                         recovering = False
@@ -298,7 +324,7 @@ def deep_recover(device, output_path, file_types):
                             recovered_file.write(buffer[:take])
                             written += take
                             print('Wrote file: ' + os.path.join(
-                                output_path, str(recovered_file_id) + '.' + current_type))
+                                output_path, name_prefix + str(recovered_file_id) + '.' + current_type))
                             recovered_file.close()
                             recovered_file = None
                             recovering = False
@@ -323,7 +349,7 @@ def deep_recover(device, output_path, file_types):
             recovered_file.write(buffer)
             recovered_file.close()
             print('Wrote file (partial, no end marker found): ' + os.path.join(
-                output_path, str(recovered_file_id) + '.' + current_type))
+                output_path, name_prefix + str(recovered_file_id) + '.' + current_type))
     finally:
         raw_device_read.close()
 
@@ -331,7 +357,72 @@ def deep_recover(device, output_path, file_types):
 def print_red(text): print("\033[91m {}\033[00m" .format(text))
 
 
-def quick_recover(device, outpath, inodes):
+def get_inode_block_group(device, inode):
+    """Return the block group number istat reports for `inode`, or None."""
+    try:
+        out = subprocess.run(["istat", device, inode], capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    match = re.search(r'^Group:\s*(\d+)', out, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def get_group_byte_range(device, group):
+    """Return (start_byte, end_byte) covered by block `group`, via fsstat, or None."""
+    try:
+        out = subprocess.run(["fsstat", device], capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    size_match = re.search(r'Block Size:\s*(\d+)', out)
+    if not size_match:
+        return None
+    block_size = int(size_match.group(1))
+
+    group_match = re.search(
+        r'^Group:\s*' + str(group) + r':(.*?)(?=^Group:\s*\d+:|\Z)', out, re.MULTILINE | re.DOTALL
+    )
+    if not group_match:
+        return None
+    range_match = re.search(r'Block Range:\s*(\d+)\s*-\s*(\d+)', group_match.group(1))
+    if not range_match:
+        return None
+    start_block, end_block = int(range_match.group(1)), int(range_match.group(2))
+    return block_size * start_block, block_size * (end_block + 1)
+
+
+def scoped_carve_by_inode(device, inode, file_types, outpath):
+    """
+    Fallback for quick_recover(): when icat has nothing to read because the
+    filesystem already zeroed the inode's block pointers (see the ext3/ext4
+    note below), locate the block group the inode belongs to and run the
+    same signature-based carving deep_recover() does for a full device, but
+    confined to that one group's byte range. This finds the file's actual
+    content (still physically on disk, just no longer referenced by the
+    inode) without scanning - and pulling in unrelated files from - the rest
+    of the device the way a plain `dr` over the whole disk would.
+    """
+    group = get_inode_block_group(device, inode)
+    if group is None:
+        print('Could not determine the block group for inode ' + inode + ' (istat unavailable or inode gone).')
+        return False
+
+    byte_range = get_group_byte_range(device, group)
+    if byte_range is None:
+        print('Could not determine the byte range of block group ' + str(group) + ' (fsstat unavailable).')
+        return False
+
+    start_offset, end_offset = byte_range
+    print('icat returned no data for inode ' + inode +
+          ' - its block pointers were likely cleared on delete (common on ext3/ext4).')
+    print('Falling back to a signature scan of block group ' + str(group) +
+          ' (' + str(start_offset) + '-' + str(end_offset) + ' bytes) instead of the whole device...')
+    deep_recover(device, outpath, file_types, start_offset=start_offset, end_offset=end_offset,
+                 name_prefix='inode' + inode + '_')
+    return True
+
+
+def quick_recover(device, outpath, inodes, file_types):
     # FIX: original used os.system()/subprocess.check_output(..., shell=True)
     # with device/inode/filename string-concatenated into a shell command
     # line. Filenames here come from `fls` output on the target device, i.e.
@@ -341,6 +432,12 @@ def quick_recover(device, outpath, inodes):
     # default) avoids the shell entirely, so those bytes are just a filename
     # again. Output redirection (`> outfile`) is replaced by writing to the
     # file handle directly via stdout=f.
+    # FIX: on ext3/ext4, deleting a file truncates the inode (block pointers
+    # are zeroed) as soon as its link count hits zero, so `icat <inode>` can
+    # legitimately succeed (exit code 0) while writing 0 bytes, even though
+    # the file's actual content is still physically on disk. When that
+    # happens, fall back to scoped_carve_by_inode() instead of silently
+    # leaving the caller with an empty file.
     if not inodes:
         print("Showing inode number of files:")
         out = subprocess.check_output(["fls", "-r", device])
@@ -354,6 +451,10 @@ def quick_recover(device, outpath, inodes):
         with open(outfile, 'wb') as f:
             subprocess.run(["icat", device, inode], stdout=f, check=True)
         print('Wrote file: ' + outfile)
+        if os.path.getsize(outfile) == 0:
+            ext = os.path.splitext(newfile)[1].lstrip('.').lower()
+            candidate_types = [ext] if ext in file_patterns else file_types
+            scoped_carve_by_inode(device, inode, candidate_types, outpath)
     else:
         for file in inodes.split(','):
             inode, file_name = file.split(':', 1)
@@ -362,6 +463,10 @@ def quick_recover(device, outpath, inodes):
             with open(outfile, 'wb') as f:
                 subprocess.run(["icat", device, inode], stdout=f, check=True)
             print('Wrote file: ' + outfile)
+            if os.path.getsize(outfile) == 0:
+                ext = os.path.splitext(file_name)[1].lstrip('.').lower()
+                candidate_types = [ext] if ext in file_patterns else file_types
+                scoped_carve_by_inode(device, inode, candidate_types, outpath)
 
 
 if __name__ == '__main__':
@@ -395,4 +500,4 @@ if __name__ == '__main__':
     if action == "dr":
         deep_recover(device, outpath, file_types)
     if action == "qr":
-        quick_recover(device, outpath, args.inodes)
+        quick_recover(device, outpath, args.inodes, file_types)

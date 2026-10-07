@@ -11,13 +11,18 @@ It supports two recovery modes:
 - **Quick recovery (`qr`)** — recovers specific deleted files by inode,
   using [The Sleuth Kit](https://www.sleuthkit.org/sleuthkit/) (`fls`,
   `istat`, `icat`). Useful when the filesystem metadata is still present
-  (e.g. recently deleted files).
+  (e.g. recently deleted files). If `icat` comes back with 0 bytes — which
+  happens on ext3/ext4, where deleting a file zeroes the inode's block
+  pointers immediately (see below) — `qr` automatically falls back to a
+  signature scan scoped to just that inode's block group, instead of giving
+  up or requiring a full-device `dr` scan.
 
 ## Requirements
 
 - Python 3
 - For quick recovery (`qr`) only: [The Sleuth Kit](https://www.sleuthkit.org/)
-  installed and on your `PATH` (provides `fls`, `istat`, `icat`)
+  installed and on your `PATH` (provides `fls`, `istat`, `icat`, and
+  `fsstat`, the last one used by the scoped-carve fallback described below)
 - Read access to the target raw device or disk image (on Linux/macOS this
   usually means running as root / with `sudo`)
 
@@ -84,6 +89,44 @@ Recover specific inodes directly, without the interactive prompt:
 sudo python pyforensics.py qr /dev/sda1 -i 12341:photo.jpg,12342:report.pdf -o ./out
 ```
 
+### Scoped-carve fallback (ext3/ext4 zeroed inodes)
+
+On ext3/ext4, deleting a file truncates its inode — clearing the block
+pointers — as soon as the link count hits zero, even though the actual file
+content is usually still sitting untouched on disk (see the next section).
+`icat` then "succeeds" but writes 0 bytes, since it has nothing left to read
+the data from by inode alone.
+
+When that happens, `qr` automatically:
+
+1. Reads the inode's block group number via `istat`.
+2. Reads that block group's byte range via `fsstat`.
+3. Runs the same signature-based carving `dr` uses, but **confined to that
+   one block group** instead of scanning the whole device — so you still
+   get the file back without also pulling in unrelated files from
+   elsewhere on the disk the way a full `dr` scan would.
+
+The file type to scan for is guessed from the extension you gave the output
+file (e.g. `12341:photo.png` scans for `png`); if the extension isn't
+recognized, it falls back to whatever `-f` was given (default `jpg`).
+Results from this fallback are written as `inode<N>_<n>.<ext>` so they never
+collide with a previous `dr`/`qr` run's output in the same folder.
+
+```bash
+sudo python pyforensics.py qr /dev/sda1 -i 13:photo.png -o ./out
+# icat returned no data for inode 13 - its block pointers were likely
+# cleared on delete (common on ext3/ext4).
+# Falling back to a signature scan of block group 0 (0-134217728 bytes)...
+# -> ./out/inode13_0.png
+```
+
+This is a best-effort heuristic, not a guarantee: ext4's allocator usually
+keeps a file's data blocks in the same (or a nearby) group as its inode for
+performance, but under heavy fragmentation or a nearly-full group it can
+place them elsewhere, in which case the scoped scan won't find them and a
+full `dr` scan (or journal-based recovery with a tool like `extundelete`)
+is the next step.
+
 ## When is a deleted file actually recoverable?
 
 Deleting a file on Linux usually only removes the directory entry/inode
@@ -104,6 +147,11 @@ blocks untouched:
   recovery) targets
 - Deletion on a plain **HDD** with no TRIM involved — blocks sit untouched
   until actually overwritten by new writes
+- `rm`/`rm -rf` on **ext3/ext4** specifically — the inode's block pointers
+  get zeroed immediately, so `qr`'s plain `icat` step comes back empty, but
+  the data blocks themselves are untouched. This is a metadata problem, not
+  a physical one, which is why `qr`'s scoped-carve fallback (above) can
+  usually still get the file back even though a direct inode lookup can't.
 
 ### Not recoverable
 
