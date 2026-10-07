@@ -84,6 +84,56 @@ Recover specific inodes directly, without the interactive prompt:
 sudo python pyforensics.py qr /dev/sda1 -i 12341:photo.jpg,12342:report.pdf -o ./out
 ```
 
+## When is a deleted file actually recoverable?
+
+Deleting a file on Linux usually only removes the directory entry/inode
+pointer — the underlying data blocks stay on disk until something else
+overwrites them. Whether this tool (or any recovery tool) can get the file
+back depends entirely on whether those bytes still exist on the medium.
+
+### Likely recoverable
+
+These only unlink the file or rewrite metadata, leaving the actual data
+blocks untouched:
+
+- `rm`, `rm -f`, `rm -rf`, deleting via a file manager, moving to Trash
+- An application calling `unlink()` internally (e.g. `git rm`, most "delete"
+  buttons in software)
+- A quick format (`mkfs` without a wipe pass) — old data blocks are usually
+  still present, which is exactly the scenario `dr` (deep/signature-based
+  recovery) targets
+- Deletion on a plain **HDD** with no TRIM involved — blocks sit untouched
+  until actually overwritten by new writes
+
+### Not recoverable
+
+These actively overwrite or physically erase the data, so the original
+bytes no longer exist anywhere to carve out:
+
+- `shred`, and secure-delete tools like `srm`, `wipe`, `scrub`
+- `dd if=/dev/zero` / `dd if=/dev/urandom` over a file, partition, or device
+- `blkdiscard`, `fstrim` (including the `fstrim.timer` many distros run
+  weekly by default), or any filesystem mounted with `discard` — these send
+  **TRIM** commands that make an SSD's firmware erase the underlying flash
+  cells almost immediately, independent of any later overwrite
+- An SSD's own internal garbage collection, which can reclaim unmapped
+  blocks on its own — this is why recovery is generally much harder on SSDs
+  than on HDDs
+- `cryptsetup luksErase` or discarding an encryption header — the
+  ciphertext may still be there, but without the key it's unreadable
+- Ordinary disk activity after deletion (installing software, copying large
+  files, logging) that happens to reuse the freed blocks
+
+### Can the code fix this?
+
+No — this is a physical limitation, not a software bug. No recovery tool
+can carve out bytes that have been overwritten or TRIMed off the storage
+medium; the original data simply no longer exists to read. The best
+mitigation is prevention: stop writing to the affected device immediately
+after an accidental delete (unmount it if possible) and recover from a
+**copy/image** rather than the live device, before TRIM or new writes can
+run.
+
 ## Notes
 
 - Deep recovery relies on recognizing file signatures and, for some types,
