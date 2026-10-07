@@ -176,10 +176,9 @@ parser.add_argument(
         help='Inodes for quick recovery. Ex: 12341:file1.doc,12342:file2.pdf')
 parser.add_argument(
     '-f', '--file_types', type=str, nargs='?', dest='file_types', default='jpg',
-    help=('File types to scan for, separated by comma. Ex: jpg,png,exe. [default=jpg]\n'
-          'Used by deep recovery (dr), and as a fallback hint for quick\n'
-          'recovery (qr) when icat returns no data and the output filename\n'
-          'has no recognized extension.'),
+    help=('File types for deep recovery (dr) to scan for, separated by comma.\n'
+          'Ex: jpg,png,exe. [default=jpg]. Not used by quick recovery (qr) -\n'
+          'its scoped-carve fallback always scans for every known file type.'),
 )
 parser.add_argument(
     '-o', '--output_path', type=str, nargs='?', dest='output_path', default='recovered',
@@ -360,47 +359,6 @@ def deep_recover(device, output_path, file_types, start_offset=0, end_offset=Non
 def print_red(text): print("\033[91m {}\033[00m" .format(text))
 
 
-def list_fls_entries(device):
-    """
-    Map inode number -> original filename by parsing `fls -r` output
-    (lines like "r/r * 13:  photo.png"). This is the filesystem's own
-    record of the file's real name/extension, independent of whatever name
-    a user later chooses to save the recovered content as - used so the
-    scoped-carve fallback below can know which signature to scan for the
-    same way `dr` is explicitly told via -f, instead of guessing from a
-    user-typed output filename that may not match the original at all.
-    """
-    try:
-        out = subprocess.check_output(["fls", "-r", device]).decode('utf-8', errors='replace')
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return {}
-    entries = {}
-    for line in out.splitlines():
-        match = re.match(r'^\S+/\S+\s+(?:\*\s+)?(\d+):\s*(.+?)\s*$', line)
-        if match:
-            entries[match.group(1)] = match.group(2)
-    return entries
-
-
-def resolve_scan_types(device, inode, user_given_name, fallback_types):
-    """
-    Pick which file type(s) to carve for in the scoped-carve fallback.
-    Prefers the inode's real original filename from `fls -r` (the
-    authoritative source - same idea as `dr`'s explicit -f) over the name
-    the user happened to save the (empty) icat output as, and only falls
-    back to -f's file_types if neither has a recognized extension.
-    """
-    original_name = list_fls_entries(device).get(inode)
-    for name, source in ((original_name, 'fls listing'), (user_given_name, 'output filename')):
-        if not name:
-            continue
-        ext = os.path.splitext(name)[1].lstrip('.').lower()
-        if ext in file_patterns:
-            print('Using "' + ext + '" as the scan type, from the ' + source + " ('" + name + "').")
-            return [ext]
-    return fallback_types
-
-
 def get_inode_block_group(device, inode):
     """Return the block group number istat reports for `inode`, or None."""
     try:
@@ -475,7 +433,7 @@ def get_scan_byte_range(device, group):
     return (block_size * start_block, block_size * (end_block + 1)), 'block group ' + str(group)
 
 
-def scoped_carve_by_inode(device, inode, file_types, outpath):
+def scoped_carve_by_inode(device, inode, outpath):
     """
     Fallback for quick_recover(): when icat has nothing to read because the
     filesystem already zeroed the inode's block pointers (see the ext3/ext4
@@ -486,6 +444,13 @@ def scoped_carve_by_inode(device, inode, file_types, outpath):
     content (still physically on disk, just no longer referenced by the
     inode) without scanning - and pulling in unrelated files from - the rest
     of the device the way a plain `dr` over the whole disk would.
+
+    Scans for every file type pyforensics knows about rather than guessing
+    a single one from a filename: once a deleted inode's directory entry is
+    also gone (see the $OrphanFiles note below), there is no reliable way
+    to know the real original type, and since the scan is already confined
+    to one block/flex group instead of the whole device, checking every
+    known signature there is cheap.
     """
     group = get_inode_block_group(device, inode)
     if group is None:
@@ -498,21 +463,23 @@ def scoped_carve_by_inode(device, inode, file_types, outpath):
         return False
 
     start_offset, end_offset = byte_range
+    all_types = sorted(file_patterns.keys())
     print('icat returned no data for inode ' + inode +
           ' - its block pointers were likely cleared on delete (common on ext3/ext4).')
     print('Falling back to a signature scan of ' + description +
-          ' (' + str(start_offset) + '-' + str(end_offset) + ' bytes) instead of the whole device...')
-    found = deep_recover(device, outpath, file_types, start_offset=start_offset, end_offset=end_offset,
+          ' (' + str(start_offset) + '-' + str(end_offset) + ' bytes), for all known file types,'
+          ' instead of the whole device...')
+    found = deep_recover(device, outpath, all_types, start_offset=start_offset, end_offset=end_offset,
                           name_prefix='inode' + inode + '_')
     if found == 0:
-        print('No ' + '/'.join(file_types) + ' signature found in ' + description + '.')
+        print('No known file signature found in ' + description + '.')
         print('Either the data has already been overwritten, or it lives outside this scoped area.')
-        print('Next step: try a full scan - dr ' + device + ' -f ' + ','.join(file_types))
+        print('Next step: try a full scan - dr ' + device + ' -f ' + ','.join(all_types))
         return False
     return True
 
 
-def quick_recover(device, outpath, inodes, file_types):
+def quick_recover(device, outpath, inodes):
     # FIX: original used os.system()/subprocess.check_output(..., shell=True)
     # with device/inode/filename string-concatenated into a shell command
     # line. Filenames here come from `fls` output on the target device, i.e.
@@ -542,13 +509,7 @@ def quick_recover(device, outpath, inodes, file_types):
             subprocess.run(["icat", device, inode], stdout=f, check=True)
         print('Wrote file: ' + outfile)
         if os.path.getsize(outfile) == 0:
-            # FIX: was guessing the scan type purely from `newfile`, whatever
-            # the user happened to type as a save-as name - easy to get
-            # wrong/mismatched. resolve_scan_types() prefers the inode's
-            # real original filename from `fls -r` instead, the same
-            # authoritative source Sleuth Kit itself already showed above.
-            candidate_types = resolve_scan_types(device, inode, newfile, file_types)
-            scoped_carve_by_inode(device, inode, candidate_types, outpath)
+            scoped_carve_by_inode(device, inode, outpath)
     else:
         for file in inodes.split(','):
             inode, file_name = file.split(':', 1)
@@ -558,8 +519,7 @@ def quick_recover(device, outpath, inodes, file_types):
                 subprocess.run(["icat", device, inode], stdout=f, check=True)
             print('Wrote file: ' + outfile)
             if os.path.getsize(outfile) == 0:
-                candidate_types = resolve_scan_types(device, inode, file_name, file_types)
-                scoped_carve_by_inode(device, inode, candidate_types, outpath)
+                scoped_carve_by_inode(device, inode, outpath)
 
 
 if __name__ == '__main__':
@@ -574,23 +534,21 @@ if __name__ == '__main__':
     action = args.action[0]
     device = args.device[0]
     outpath = args.output_path
-    file_types = args.file_types.split(",") if args.file_types else ['jpg']
-
-    # FIX: an unrecognized -f value (e.g. a typo like "jpeg") used to crash
-    # deep_recover() with an uncaught KeyError the first time it indexed
-    # file_patterns[file_type]. Validate up front and fail with a clear
-    # message instead.
-    unknown_types = [t for t in file_types if t not in file_patterns]
-    if unknown_types:
-        raise SystemExit(
-            'Unknown file type(s): ' + ', '.join(unknown_types) +
-            '\nValid types: ' + ', '.join(sorted(file_patterns.keys()))
-        )
-
     # Create a new directory because it does not exist
     if outpath and not os.path.exists(outpath):
         os.makedirs(outpath)
     if action == "dr":
+        file_types = args.file_types.split(",") if args.file_types else ['jpg']
+        # FIX: an unrecognized -f value (e.g. a typo like "jpeg") used to
+        # crash deep_recover() with an uncaught KeyError the first time it
+        # indexed file_patterns[file_type]. Validate up front and fail with
+        # a clear message instead.
+        unknown_types = [t for t in file_types if t not in file_patterns]
+        if unknown_types:
+            raise SystemExit(
+                'Unknown file type(s): ' + ', '.join(unknown_types) +
+                '\nValid types: ' + ', '.join(sorted(file_patterns.keys()))
+            )
         deep_recover(device, outpath, file_types)
     if action == "qr":
-        quick_recover(device, outpath, args.inodes, file_types)
+        quick_recover(device, outpath, args.inodes)

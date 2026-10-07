@@ -41,7 +41,7 @@ python pyforensics.py <action> <device> [options]
 
 | Flag | Description |
 |---|---|
-| `-f`, `--file_types` | Comma-separated file types to scan for in deep recovery (e.g. `jpg,png,pdf`). Default: `jpg` |
+| `-f`, `--file_types` | Comma-separated file types to scan for in deep recovery (e.g. `jpg,png,pdf`). Default: `jpg`. Not used by `qr` — see the scoped-carve fallback below |
 | `-o`, `--output_path` | Directory to write recovered files to. Created automatically if missing. Default: `recovered` |
 | `-i`, `--inodes` | Inode(s) for quick recovery, e.g. `12341:photo.jpg,12342:report.pdf`. If omitted, `qr` lists deleted files interactively |
 | `-v`, `--version` | Print the tool's version and exit |
@@ -108,30 +108,27 @@ When that happens, `qr` automatically:
    in, so a single-group scan can easily miss data that is still right
    there.
 3. Runs the same signature-based carving `dr` uses, but **confined to that
-   area** instead of scanning the whole device — so you still get the file
-   back without also pulling in unrelated files from elsewhere on the disk
-   the way a full `dr` scan would.
+   area** instead of scanning the whole device, and for **every file type
+   `pyforensics` knows about** (not just one guessed type) — `-f` is
+   ignored here. Scanning the full type list is cheap since the area is
+   already scoped to one block/flex group rather than the whole device,
+   and it means a deleted file's type never needs to be guessed correctly
+   up front: by the time an inode is orphaned (see the note below), there
+   is often no reliable way to know its real original type anyway, so
+   trying all of them is both simpler and more robust than guessing one.
 
 If nothing is found even in that widened area, `qr` says so explicitly
-(`No <type> signature found in ...`) instead of quietly doing nothing, and
-suggests running a full `dr` scan as the next step.
-
-The file type to scan for is resolved the same way `dr` is told what to
-look for, just automatically: it first re-reads `fls -r` to find the
-inode's **real original filename** and uses its extension (e.g. inode 13
-was really `original_photo.png`, so it scans for `png`) — not the name you
-happen to save the (empty) `icat` output as, which might not match at all.
-Only if the original name is gone or has no recognized extension does it
-fall back to the extension of the output filename you gave, then to
-whatever `-f` was given (default `jpg`). Results from this fallback are
-written as `inode<N>_<n>.<ext>` so they never collide with a previous
-`dr`/`qr` run's output in the same folder.
+(`No known file signature found in ...`) instead of quietly doing nothing,
+and suggests running a full `dr` scan as the next step. Results from this
+fallback are written as `inode<N>_<n>.<ext>` so they never collide with a
+previous `dr`/`qr` run's output in the same folder.
 
 Note: once a deleted inode shows up under `fls -r`'s `$OrphanFiles` as
 `OrphanFile-<N>` instead of its real name, the directory entry itself is
-gone too (not just the inode's block pointers) — at that point even `fls`
-no longer knows the original filename, so the extension you give on the
-command line (or `-f`) is the only source left for picking a scan type.
+gone too (not just the inode's block pointers) — at that point `fls` no
+longer knows the original filename or type at all, which is exactly why
+the fallback above scans for every known type instead of relying on a
+guess.
 
 ```bash
 sudo python pyforensics.py qr /dev/sda1 -i 13:photo.png -o ./out
