@@ -127,6 +127,12 @@ whatever `-f` was given (default `jpg`). Results from this fallback are
 written as `inode<N>_<n>.<ext>` so they never collide with a previous
 `dr`/`qr` run's output in the same folder.
 
+Note: once a deleted inode shows up under `fls -r`'s `$OrphanFiles` as
+`OrphanFile-<N>` instead of its real name, the directory entry itself is
+gone too (not just the inode's block pointers) — at that point even `fls`
+no longer knows the original filename, so the extension you give on the
+command line (or `-f`) is the only source left for picking a scan type.
+
 ```bash
 sudo python pyforensics.py qr /dev/sda1 -i 13:photo.png -o ./out
 # icat returned no data for inode 13 - its block pointers were likely

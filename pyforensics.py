@@ -451,7 +451,14 @@ def get_scan_byte_range(device, group):
     if group not in ranges:
         return None, None
 
-    flex_match = re.search(r'Flex Block Group Size:\s*(\d+)', out)
+    # FIX: real Sleuth Kit fsstat output labels this "Block Groups Per Flex
+    # Group" (confirmed against real ext4 output), not "Flex Block Group
+    # Size" as originally guessed here - the wrong label meant this regex
+    # never matched, so flex_bg was never detected and every scoped scan
+    # silently stayed single-group even on flex_bg filesystems. Matching
+    # both labels going forward in case older Sleuth Kit versions phrase it
+    # differently.
+    flex_match = re.search(r'(?:Flex Block Group Size|Block Groups Per Flex Group):\s*(\d+)', out)
     flex_size = int(flex_match.group(1)) if flex_match else None
 
     if flex_size and flex_size > 1:
