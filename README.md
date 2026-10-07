@@ -100,11 +100,21 @@ the data from by inode alone.
 When that happens, `qr` automatically:
 
 1. Reads the inode's block group number via `istat`.
-2. Reads that block group's byte range via `fsstat`.
+2. Reads that block group's byte range via `fsstat`. If the filesystem uses
+   `flex_bg` (the `mke2fs` default for a long time now), the scan is
+   widened to the inode's whole **flex group cluster** instead of just its
+   single nominal block group — under flex_bg, a file's data blocks can
+   land anywhere in that cluster, not only the group the inode itself is
+   in, so a single-group scan can easily miss data that is still right
+   there.
 3. Runs the same signature-based carving `dr` uses, but **confined to that
-   one block group** instead of scanning the whole device — so you still
-   get the file back without also pulling in unrelated files from
-   elsewhere on the disk the way a full `dr` scan would.
+   area** instead of scanning the whole device — so you still get the file
+   back without also pulling in unrelated files from elsewhere on the disk
+   the way a full `dr` scan would.
+
+If nothing is found even in that widened area, `qr` says so explicitly
+(`No <type> signature found in ...`) instead of quietly doing nothing, and
+suggests running a full `dr` scan as the next step.
 
 The file type to scan for is resolved the same way `dr` is told what to
 look for, just automatically: it first re-reads `fls -r` to find the
@@ -125,12 +135,12 @@ sudo python pyforensics.py qr /dev/sda1 -i 13:photo.png -o ./out
 # -> ./out/inode13_0.png
 ```
 
-This is a best-effort heuristic, not a guarantee: ext4's allocator usually
-keeps a file's data blocks in the same (or a nearby) group as its inode for
-performance, but under heavy fragmentation or a nearly-full group it can
-place them elsewhere, in which case the scoped scan won't find them and a
-full `dr` scan (or journal-based recovery with a tool like `extundelete`)
-is the next step.
+This is still a best-effort heuristic, not a guarantee: ext4's allocator
+usually keeps a file's data blocks within its inode's flex group for
+performance, but under heavy fragmentation or when that whole cluster is
+nearly full it can place them elsewhere, in which case the scoped scan
+won't find them and a full `dr` scan (or journal-based recovery with a
+tool like `extundelete`) is the next step.
 
 ## When is a deleted file actually recoverable?
 

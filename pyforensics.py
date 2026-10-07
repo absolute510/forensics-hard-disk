@@ -350,8 +350,11 @@ def deep_recover(device, output_path, file_types, start_offset=0, end_offset=Non
             recovered_file.close()
             print('Wrote file (partial, no end marker found): ' + os.path.join(
                 output_path, name_prefix + str(recovered_file_id) + '.' + current_type))
+            recovered_file_id += 1
     finally:
         raw_device_read.close()
+
+    return recovered_file_id
 
 
 def print_red(text): print("\033[91m {}\033[00m" .format(text))
@@ -408,37 +411,71 @@ def get_inode_block_group(device, inode):
     return int(match.group(1)) if match else None
 
 
-def get_group_byte_range(device, group):
-    """Return (start_byte, end_byte) covered by block `group`, via fsstat, or None."""
+def parse_group_block_ranges(fsstat_out):
+    """Return {group_number: (start_block, end_block)} parsed from fsstat output."""
+    ranges = {}
+    for match in re.finditer(
+        r'^Group:\s*(\d+):(.*?)(?=^Group:\s*\d+:|\Z)', fsstat_out, re.MULTILINE | re.DOTALL
+    ):
+        range_match = re.search(r'Block Range:\s*(\d+)\s*-\s*(\d+)', match.group(2))
+        if range_match:
+            ranges[int(match.group(1))] = (int(range_match.group(1)), int(range_match.group(2)))
+    return ranges
+
+
+def get_scan_byte_range(device, group):
+    """
+    Return ((start_byte, end_byte), description) to scan for data belonging
+    to block `group`, via fsstat, or (None, None).
+
+    Modern ext4 (mke2fs default for a long time) uses "flex_bg": the inode
+    and block bitmaps/tables for a cluster of block groups are packed
+    together, but actual file DATA blocks can land anywhere within that
+    whole cluster, not just the nominal group the inode itself is in. If
+    fsstat reports a flex group size, we widen the scan to the inode's
+    entire flex group cluster instead of just its single nominal group -
+    otherwise a file's data commonly ends up just outside a single-group
+    scan and looks like it "isn't there" when it actually still is.
+    """
     try:
         out = subprocess.run(["fsstat", device], capture_output=True, text=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+        return None, None
 
     size_match = re.search(r'Block Size:\s*(\d+)', out)
     if not size_match:
-        return None
+        return None, None
     block_size = int(size_match.group(1))
 
-    group_match = re.search(
-        r'^Group:\s*' + str(group) + r':(.*?)(?=^Group:\s*\d+:|\Z)', out, re.MULTILINE | re.DOTALL
-    )
-    if not group_match:
-        return None
-    range_match = re.search(r'Block Range:\s*(\d+)\s*-\s*(\d+)', group_match.group(1))
-    if not range_match:
-        return None
-    start_block, end_block = int(range_match.group(1)), int(range_match.group(2))
-    return block_size * start_block, block_size * (end_block + 1)
+    ranges = parse_group_block_ranges(out)
+    if group not in ranges:
+        return None, None
+
+    flex_match = re.search(r'Flex Block Group Size:\s*(\d+)', out)
+    flex_size = int(flex_match.group(1)) if flex_match else None
+
+    if flex_size and flex_size > 1:
+        flex_index = group // flex_size
+        flex_groups = [g for g in ranges if flex_index * flex_size <= g < (flex_index + 1) * flex_size]
+        if len(flex_groups) > 1:
+            start_block = min(ranges[g][0] for g in flex_groups)
+            end_block = max(ranges[g][1] for g in flex_groups)
+            description = ('flex group ' + str(flex_index) +
+                            ' (block groups ' + str(min(flex_groups)) + '-' + str(max(flex_groups)) + ')')
+            return (block_size * start_block, block_size * (end_block + 1)), description
+
+    start_block, end_block = ranges[group]
+    return (block_size * start_block, block_size * (end_block + 1)), 'block group ' + str(group)
 
 
 def scoped_carve_by_inode(device, inode, file_types, outpath):
     """
     Fallback for quick_recover(): when icat has nothing to read because the
     filesystem already zeroed the inode's block pointers (see the ext3/ext4
-    note below), locate the block group the inode belongs to and run the
-    same signature-based carving deep_recover() does for a full device, but
-    confined to that one group's byte range. This finds the file's actual
+    note below), locate the block group (or flex group, see
+    get_scan_byte_range) the inode belongs to and run the same
+    signature-based carving deep_recover() does for a full device, but
+    confined to that area's byte range. This finds the file's actual
     content (still physically on disk, just no longer referenced by the
     inode) without scanning - and pulling in unrelated files from - the rest
     of the device the way a plain `dr` over the whole disk would.
@@ -448,7 +485,7 @@ def scoped_carve_by_inode(device, inode, file_types, outpath):
         print('Could not determine the block group for inode ' + inode + ' (istat unavailable or inode gone).')
         return False
 
-    byte_range = get_group_byte_range(device, group)
+    byte_range, description = get_scan_byte_range(device, group)
     if byte_range is None:
         print('Could not determine the byte range of block group ' + str(group) + ' (fsstat unavailable).')
         return False
@@ -456,10 +493,15 @@ def scoped_carve_by_inode(device, inode, file_types, outpath):
     start_offset, end_offset = byte_range
     print('icat returned no data for inode ' + inode +
           ' - its block pointers were likely cleared on delete (common on ext3/ext4).')
-    print('Falling back to a signature scan of block group ' + str(group) +
+    print('Falling back to a signature scan of ' + description +
           ' (' + str(start_offset) + '-' + str(end_offset) + ' bytes) instead of the whole device...')
-    deep_recover(device, outpath, file_types, start_offset=start_offset, end_offset=end_offset,
-                 name_prefix='inode' + inode + '_')
+    found = deep_recover(device, outpath, file_types, start_offset=start_offset, end_offset=end_offset,
+                          name_prefix='inode' + inode + '_')
+    if found == 0:
+        print('No ' + '/'.join(file_types) + ' signature found in ' + description + '.')
+        print('Either the data has already been overwritten, or it lives outside this scoped area.')
+        print('Next step: try a full scan - dr ' + device + ' -f ' + ','.join(file_types))
+        return False
     return True
 
 
