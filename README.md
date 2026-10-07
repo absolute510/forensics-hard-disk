@@ -106,11 +106,16 @@ When that happens, `qr` automatically:
    get the file back without also pulling in unrelated files from
    elsewhere on the disk the way a full `dr` scan would.
 
-The file type to scan for is guessed from the extension you gave the output
-file (e.g. `12341:photo.png` scans for `png`); if the extension isn't
-recognized, it falls back to whatever `-f` was given (default `jpg`).
-Results from this fallback are written as `inode<N>_<n>.<ext>` so they never
-collide with a previous `dr`/`qr` run's output in the same folder.
+The file type to scan for is resolved the same way `dr` is told what to
+look for, just automatically: it first re-reads `fls -r` to find the
+inode's **real original filename** and uses its extension (e.g. inode 13
+was really `original_photo.png`, so it scans for `png`) — not the name you
+happen to save the (empty) `icat` output as, which might not match at all.
+Only if the original name is gone or has no recognized extension does it
+fall back to the extension of the output filename you gave, then to
+whatever `-f` was given (default `jpg`). Results from this fallback are
+written as `inode<N>_<n>.<ext>` so they never collide with a previous
+`dr`/`qr` run's output in the same folder.
 
 ```bash
 sudo python pyforensics.py qr /dev/sda1 -i 13:photo.png -o ./out

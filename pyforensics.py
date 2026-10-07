@@ -357,6 +357,47 @@ def deep_recover(device, output_path, file_types, start_offset=0, end_offset=Non
 def print_red(text): print("\033[91m {}\033[00m" .format(text))
 
 
+def list_fls_entries(device):
+    """
+    Map inode number -> original filename by parsing `fls -r` output
+    (lines like "r/r * 13:  photo.png"). This is the filesystem's own
+    record of the file's real name/extension, independent of whatever name
+    a user later chooses to save the recovered content as - used so the
+    scoped-carve fallback below can know which signature to scan for the
+    same way `dr` is explicitly told via -f, instead of guessing from a
+    user-typed output filename that may not match the original at all.
+    """
+    try:
+        out = subprocess.check_output(["fls", "-r", device]).decode('utf-8', errors='replace')
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    entries = {}
+    for line in out.splitlines():
+        match = re.match(r'^\S+/\S+\s+(?:\*\s+)?(\d+):\s*(.+?)\s*$', line)
+        if match:
+            entries[match.group(1)] = match.group(2)
+    return entries
+
+
+def resolve_scan_types(device, inode, user_given_name, fallback_types):
+    """
+    Pick which file type(s) to carve for in the scoped-carve fallback.
+    Prefers the inode's real original filename from `fls -r` (the
+    authoritative source - same idea as `dr`'s explicit -f) over the name
+    the user happened to save the (empty) icat output as, and only falls
+    back to -f's file_types if neither has a recognized extension.
+    """
+    original_name = list_fls_entries(device).get(inode)
+    for name, source in ((original_name, 'fls listing'), (user_given_name, 'output filename')):
+        if not name:
+            continue
+        ext = os.path.splitext(name)[1].lstrip('.').lower()
+        if ext in file_patterns:
+            print('Using "' + ext + '" as the scan type, from the ' + source + " ('" + name + "').")
+            return [ext]
+    return fallback_types
+
+
 def get_inode_block_group(device, inode):
     """Return the block group number istat reports for `inode`, or None."""
     try:
@@ -452,8 +493,12 @@ def quick_recover(device, outpath, inodes, file_types):
             subprocess.run(["icat", device, inode], stdout=f, check=True)
         print('Wrote file: ' + outfile)
         if os.path.getsize(outfile) == 0:
-            ext = os.path.splitext(newfile)[1].lstrip('.').lower()
-            candidate_types = [ext] if ext in file_patterns else file_types
+            # FIX: was guessing the scan type purely from `newfile`, whatever
+            # the user happened to type as a save-as name - easy to get
+            # wrong/mismatched. resolve_scan_types() prefers the inode's
+            # real original filename from `fls -r` instead, the same
+            # authoritative source Sleuth Kit itself already showed above.
+            candidate_types = resolve_scan_types(device, inode, newfile, file_types)
             scoped_carve_by_inode(device, inode, candidate_types, outpath)
     else:
         for file in inodes.split(','):
@@ -464,8 +509,7 @@ def quick_recover(device, outpath, inodes, file_types):
                 subprocess.run(["icat", device, inode], stdout=f, check=True)
             print('Wrote file: ' + outfile)
             if os.path.getsize(outfile) == 0:
-                ext = os.path.splitext(file_name)[1].lstrip('.').lower()
-                candidate_types = [ext] if ext in file_patterns else file_types
+                candidate_types = resolve_scan_types(device, inode, file_name, file_types)
                 scoped_carve_by_inode(device, inode, candidate_types, outpath)
 
 
