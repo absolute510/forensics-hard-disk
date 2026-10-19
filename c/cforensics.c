@@ -1,15 +1,26 @@
 /*
- * cforensics - C port of pyforensics (signature-based file carving + Sleuth Kit quick recovery)
+ * cforensics - bản C của pyforensics (khôi phục file bằng signature + Sleuth Kit)
  *
- * Build:  gcc -O2 -Wall -Wextra -std=c11 -o cforensics cforensics.c      (or: make)
- *         cl /O2 /W3 cforensics.c                                        (MSVC)
+ * Build:  gcc -O2 -Wall -Wextra -std=c11 -o cforensics cforensics.c      (hoặc: make)
+ *         cl /utf-8 /O2 /W3 cforensics.c                                 (MSVC)
  *
- * Deep recovery (dr) works on a sliding window over a single malloc'd buffer:
- * "p" is a pointer to the first unconsumed byte and "len" the bytes after it.
- * Consuming data is just p += n; len -= n (no slicing/copying like the
- * Python bytes objects). The only copy is a tiny memmove of the (< MAX_RESERVE)
- * carry-over bytes when the window is refilled, which keeps signatures that
- * straddle two reads visible in one piece.
+ * BỐ CỤC FILE
+ *   1. Bảng signature (FILE_TYPES)      - "đầu/đuôi" của từng loại file
+ *   2. Hàm tiện ích                     - tìm chuỗi byte, in màu, tạo thư mục
+ *   3. deep_recover()  (lệnh dr)        - quét thiết bị, cắt file theo signature
+ *   4. Quick recovery  (lệnh qr)        - gọi Sleuth Kit, thất bại thì carve có phạm vi
+ *   5. main()                           - đọc tham số dòng lệnh, chọn dr hoặc qr
+ *
+ * Ý TƯỞNG CỐT LÕI CỦA dr (dùng con trỏ):
+ * Đọc thiết bị từng khối 1 MB vào MỘT buffer duy nhất. Con trỏ "p" trỏ tới byte
+ * đầu tiên chưa xử lý, "len" là số byte còn lại kể từ p:
+ *
+ *     buf: [ đã xử lý ][p -> byte chưa xử lý ... (len byte) ]
+ *
+ * Xử lý xong n byte chỉ cần p += n; len -= n; (không cắt/copy chuỗi như
+ * buffer = buffer[n:] trong Python). Lần duy nhất có copy là khi nạp thêm dữ liệu:
+ * memmove vài byte đuôi (< MAX_RESERVE) lên đầu buffer, để signature nằm vắt qua
+ * ranh giới hai lần đọc vẫn liền nhau trong bộ nhớ.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -37,20 +48,23 @@
 #endif
 
 #define VERSION "1.0.0"
-#define READ_SIZE (1024u * 1024u)
-#define MAX_RESERVE 64u /* must exceed the longest signature - 1 */
+#define READ_SIZE (1024u * 1024u) /* mỗi lần đọc thiết bị 1 MB */
+#define MAX_RESERVE 64u           /* chỗ chừa cho byte đuôi mang sang lần đọc sau; phải > độ dài signature dài nhất - 1 */
 #define PATH_MAX_LEN 4096
 
+/* Một chuỗi byte (signature) kèm độ dài; cần độ dài riêng vì signature có thể chứa byte 0x00 */
 typedef struct {
     const unsigned char *data;
     size_t len;
 } Bytes;
 
+/* Một cặp nhận dạng: bytes mở đầu file và bytes kết thúc file */
 typedef struct {
     Bytes start;
     Bytes end;
 } Pattern;
 
+/* Một loại file: tên/đuôi, danh sách pattern (mp3 có 2), và kích thước tối đa được ghi */
 typedef struct {
     const char *name;
     const Pattern *patterns;
@@ -58,6 +72,7 @@ typedef struct {
     uint64_t max_size;
 } FileType;
 
+/* B("...") đóng gói chuỗi literal thành Bytes; sizeof - 1 bỏ ký tự NUL kết thúc nên vẫn đúng với byte 0x00 */
 #define B(s) { (const unsigned char *)(s), sizeof(s) - 1 }
 
 #define MAX_BIG 155000000ULL
@@ -101,6 +116,9 @@ static const FileType FILE_TYPES[] = {
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Tìm needle trong hay (như memmem, vốn không có sẵn trên Windows).
+ * Trả về con trỏ tới chỗ khớp đầu tiên, hoặc NULL. Dùng memchr nhảy tới byte đầu
+ * của needle cho nhanh, rồi memcmp để xác nhận. */
 static const unsigned char *find_bytes(const unsigned char *hay, size_t hlen,
                                        const unsigned char *needle, size_t nlen)
 {
@@ -148,17 +166,19 @@ static void make_dir(const char *path)
 /* deep recovery                                                       */
 /* ------------------------------------------------------------------ */
 
+/* "Cửa sổ" trượt trên thiết bị: trạng thái đọc của deep_recover */
 typedef struct {
-    FILE *f;
-    uint64_t pos;
-    uint64_t end; /* valid only if has_end */
+    FILE *f;            /* thiết bị/image đang đọc */
+    uint64_t pos;       /* vị trí byte tiếp theo sẽ đọc trên thiết bị */
+    uint64_t end;       /* điểm dừng; chỉ có nghĩa khi has_end (dùng cho quét theo vùng ở qr) */
     int has_end;
-    unsigned char *buf; /* capacity READ_SIZE + MAX_RESERVE */
-    unsigned char *p;   /* first unconsumed byte */
-    size_t len;         /* unconsumed bytes at p */
+    unsigned char *buf; /* vùng nhớ cấp phát một lần, kích thước READ_SIZE + MAX_RESERVE */
+    unsigned char *p;   /* con trỏ tới byte đầu tiên chưa xử lý */
+    size_t len;         /* số byte chưa xử lý tính từ p */
 } Window;
 
-/* Refill: slide the few carry-over bytes to the front, append one new chunk. Returns bytes read. */
+/* Nạp thêm dữ liệu: dời vài byte đuôi còn sót lên đầu buffer (memmove), rồi đọc nối
+ * thêm một khối ngay sau chúng. Trả về số byte đọc được; 0 nghĩa là hết dữ liệu/hết vùng. */
 static size_t window_fill(Window *w)
 {
     size_t want = READ_SIZE;
@@ -190,7 +210,15 @@ static FILE *open_out(const char *path)
     return f;
 }
 
-/* Returns the number of files written, or -1 if the device can't be opened. */
+/*
+ * Quét [start_offset, end_offset) của thiết bị (cả thiết bị nếu has_end = 0) và cắt
+ * các file khớp signature của các loại trong types[]. Tên file ra: <prefix><số>.<đuôi>.
+ * Trả về số file đã ghi, hoặc -1 nếu không mở được thiết bị.
+ *
+ * Máy trạng thái hai pha, điều khiển bởi biến "recovering":
+ *   recovering = 0 : đang TÌM ĐẦU FILE   (tìm "start" của mọi loại được chọn)
+ *   recovering = 1 : đang GHI FILE       (chỉ tìm "end" của loại đang ghi)
+ */
 static long deep_recover(const char *device, const char *outdir, const int *types, size_t ntypes,
                          uint64_t start_offset, int has_end, uint64_t end_offset, const char *prefix)
 {
@@ -216,6 +244,8 @@ static long deep_recover(const char *device, const char *outdir, const int *type
     }
     w.p = w.buf;
 
+    /* start_reserve = độ dài signature "start" dài nhất - 1. Khi không thấy gì, chỉ cần giữ
+     * lại chừng đó byte đuôi: một signature chỉ có thể bắt đầu dở dang trong đoạn này. */
     size_t start_reserve = 0;
     for (size_t t = 0; t < ntypes; t++) {
         const FileType *ft = &FILE_TYPES[types[t]];
@@ -233,12 +263,16 @@ static long deep_recover(const char *device, const char *outdir, const int *type
 
     puts("Scanning...");
     for (;;) {
+        /* Vòng ngoài: mỗi lượt nạp thêm 1 khối, rồi xử lý cho tới khi buffer "cạn" */
         size_t got = window_fill(&w);
         int progressed = 1;
-        while (progressed) {
+        while (progressed) { /* vòng trong: lặp lại chừng nào còn xử lý được thêm trên buffer hiện tại */
             progressed = 0;
             if (!recovering) {
-                /* earliest start signature of any requested type; first listed wins ties */
+                /* --- PHA 1: tìm đầu file --- */
+                /* Lấy signature "start" xuất hiện SỚM NHẤT trong buffer trong số mọi loại được chọn
+                 * (hòa vị trí thì loại đứng trước trong danh sách thắng). Khi đã có ứng viên "best",
+                 * chỉ cần tìm trong đoạn tới best + (độ dài signature) vì xa hơn thì không thể sớm hơn. */
                 const unsigned char *best = NULL;
                 const FileType *best_type = NULL;
                 const Pattern *best_pat = NULL;
@@ -272,16 +306,19 @@ static long deep_recover(const char *device, const char *outdir, const int *type
                     w.len -= consumed;
                     progressed = 1;
                 } else if (!got && w.len <= start_reserve) {
-                    w.len = 0;
+                    w.len = 0; /* hết dữ liệu và phần đuôi quá ngắn để chứa signature: bỏ */
                 } else if (w.len > start_reserve) {
-                    /* keep only the tail that could be the beginning of a straddling signature */
+                    /* Không thấy đầu file nào: bỏ phần đã quét (chỉ dời con trỏ p, không copy)
+                     * và giữ lại đoạn đuôi có thể là phần đầu của signature bị cắt đôi. */
                     w.p += w.len - start_reserve;
                     w.len = start_reserve;
                 }
             } else {
+                /* --- PHA 2: đang ghi file; chỉ tìm marker "end" của loại hiện tại --- */
                 const Bytes *endp = &cur_pat->end;
                 const unsigned char *hit = find_bytes(w.p, w.len, endp->data, endp->len);
                 if (hit) {
+                    /* Thấy marker kết thúc: ghi mọi thứ từ p tới hết marker rồi đóng file */
                     size_t cut = (size_t)(hit - w.p) + endp->len;
                     fwrite(w.p, 1, cut, out);
                     written += cut;
@@ -295,9 +332,12 @@ static long deep_recover(const char *device, const char *outdir, const int *type
                     w.len -= cut;
                     progressed = 1;
                 } else {
+                    /* Chưa thấy marker. Phần "an toàn" để ghi ngay = tất cả trừ (độ dài end - 1) byte cuối,
+                     * vì marker có thể đang nằm dở ở đuôi buffer và hoàn tất ở lần đọc sau. */
                     size_t reserve = endp->len - 1;
                     size_t safe_len = w.len > reserve ? w.len - reserve : 0;
                     if (written + safe_len >= cur_type->max_size) {
+                        /* Chạm giới hạn kích thước: cắt đúng max_size và đóng file (không có marker) */
                         size_t take = (size_t)(cur_type->max_size - written);
                         fwrite(w.p, 1, take, out);
                         written += take;
@@ -311,6 +351,7 @@ static long deep_recover(const char *device, const char *outdir, const int *type
                         w.len -= take;
                         progressed = 1;
                     } else if (safe_len > 0) {
+                        /* Ghi phần an toàn, giữ đuôi lại cho lần nạp sau */
                         fwrite(w.p, 1, safe_len, out);
                         written += safe_len;
                         w.p += safe_len;
@@ -319,9 +360,10 @@ static long deep_recover(const char *device, const char *outdir, const int *type
                 }
             }
         }
-        if (!got) break;
+        if (!got) break; /* hết thiết bị/vùng quét */
     }
 
+    /* Hết dữ liệu giữa lúc đang ghi một file: lưu phần đã có thành file "partial" thay vì bỏ mất */
     if (recovering && out) {
         fwrite(w.p, 1, w.len, out);
         fclose(out);
@@ -338,7 +380,8 @@ static long deep_recover(const char *device, const char *outdir, const int *type
 /* quick recovery via The Sleuth Kit                                   */
 /* ------------------------------------------------------------------ */
 
-/* The command line goes through a shell (popen), so refuse anything that could be interpreted. */
+/* Lệnh Sleuth Kit chạy qua shell (popen) nên phải từ chối ký tự shell có thể diễn giải
+ * (chống command injection qua đường dẫn thiết bị). Inode và tên file có hàm kiểm tra riêng bên dưới. */
 static int safe_arg(const char *s)
 {
     if (!*s) return 0;
@@ -504,6 +547,9 @@ static int get_scan_byte_range(const char *device, int group, uint64_t *start, u
     return ok;
 }
 
+/* Dự phòng cho qr: khi icat trả 0 byte (ext3/ext4 đã xóa con trỏ block của inode), dữ liệu
+ * thật vẫn còn trên đĩa. Xác định inode thuộc block/flex group nào (istat + fsstat) rồi chạy
+ * deep_recover với MỌI loại file, nhưng chỉ trong dải byte của group đó thay vì cả ổ. */
 static int scoped_carve_by_inode(const char *device, const char *inode, const char *outdir)
 {
     int group = get_inode_block_group(device, inode);
@@ -557,6 +603,7 @@ static long long icat_to_file(const char *device, const char *inode, const char 
     return total;
 }
 
+/* Khôi phục một inode: kiểm tra đầu vào -> icat ra file -> nếu file rỗng thì carve có phạm vi */
 static int recover_one_inode(const char *device, const char *inode, const char *name, const char *outdir)
 {
     if (!valid_inode(inode)) {
