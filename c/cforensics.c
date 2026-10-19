@@ -62,6 +62,7 @@ typedef struct {
 typedef struct {
     Bytes start;
     Bytes end;
+    size_t end_extra; /* số byte cố định nằm SAU marker end vẫn thuộc về file (vd. phần còn lại của ZIP EOCD) */
 } Pattern;
 
 /* Một loại file: tên/đuôi, danh sách pattern (mp3 có 2), và kích thước tối đa được ghi */
@@ -78,28 +79,38 @@ typedef struct {
 #define MAX_BIG 155000000ULL
 #define MAX_OFFICE 10485760ULL
 
-static const Pattern P_JPG[] = {{B("\xff\xd8\xff\xe0\x00\x10\x4a\x46"), B("\xff\xd9")}};
-static const Pattern P_PNG[] = {{B("\x89\x50\x4e\x47"), B("\xff\xfc\xfd\xfe")}};
-static const Pattern P_PDF[] = {{B("\x25\x50\x44\x46\x2d\x31\x2e\x34"), B("\x25\x25\x45\x4f\x46\x0d")}};
-static const Pattern P_EXE[] = {{B("\x4d\x5a\x50"), B("\x4d\x5a")}};
-static const Pattern P_DLL[] = {{B("\x4d\x5a\x90"), B("\x4d\x5a")}};
-static const Pattern P_RDL[] = {{B("\x3c\x3f\x78\x6d\x6c\x20"), B("\x3c\x2f\x52\x65\x70\x6f\x72\x74\x3e")}};
-static const Pattern P_BAT[] = {{B("\x40\x45\x43\x48\x4f\x20\x4f\x46"), B("\x45\x4e\x44\x0d\x0a")}};
-static const Pattern P_DOCX[] = {{B("\x50\x4b\x03\x04\x14\x00"), B("\x50\x4b\x05\x06")}};
+/* JPEG: JFIF (e0), Exif (e1) và raw (db); marker kết thúc EOI ff d9.
+ * Hạn chế: ảnh Exif có thumbnail nhúng cũng chứa ff d9 nên có thể bị cắt sớm. */
+static const Pattern P_JPG[] = {
+    {B("\xff\xd8\xff\xe0\x00\x10\x4a\x46"), B("\xff\xd9"), 0},
+    {B("\xff\xd8\xff\xe1"), B("\xff\xd9"), 0},
+    {B("\xff\xd8\xff\xdb"), B("\xff\xd9"), 0},
+};
+/* PNG: đủ 8 byte signature; kết thúc bằng chunk IEND + CRC cố định (ae 42 60 82) */
+static const Pattern P_PNG[] = {{B("\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"), B("\x49\x45\x4e\x44\xae\x42\x60\x82"), 0}};
+/* PDF: "%PDF-" (mọi phiên bản, không chỉ 1.4), kết thúc "%%EOF" (không bắt buộc kèm \r) */
+static const Pattern P_PDF[] = {{B("\x25\x50\x44\x46\x2d"), B("\x25\x25\x45\x4f\x46"), 0}};
+static const Pattern P_EXE[] = {{B("\x4d\x5a\x50"), B("\x4d\x5a"), 0}};
+static const Pattern P_DLL[] = {{B("\x4d\x5a\x90"), B("\x4d\x5a"), 0}};
+static const Pattern P_RDL[] = {{B("\x3c\x3f\x78\x6d\x6c\x20"), B("\x3c\x2f\x52\x65\x70\x6f\x72\x74\x3e"), 0}};
+static const Pattern P_BAT[] = {{B("\x40\x45\x43\x48\x4f\x20\x4f\x46"), B("\x45\x4e\x44\x0d\x0a"), 0}};
+/* DOCX (ZIP): kết thúc bằng End Of Central Directory "PK\5\6" + 18 byte cố định còn lại (tổng 22 byte) */
+static const Pattern P_DOCX[] = {{B("\x50\x4b\x03\x04\x14\x00"), B("\x50\x4b\x05\x06"), 18}};
 #define XLS_SIG "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3b\x00"
 #define DOC_SIG "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3e\x00"
 #define PSD_SIG "\x38\x42\x50\x53\x00\x01\x00\x00\x00\x00\x00\x00\x00\x03"
-static const Pattern P_XLS[] = {{B(XLS_SIG), B(XLS_SIG)}};
-static const Pattern P_DOC[] = {{B(DOC_SIG), B(DOC_SIG)}};
-static const Pattern P_PSD[] = {{B(PSD_SIG), B(PSD_SIG)}};
+static const Pattern P_XLS[] = {{B(XLS_SIG), B(XLS_SIG), 0}};
+static const Pattern P_DOC[] = {{B(DOC_SIG), B(DOC_SIG), 0}};
+static const Pattern P_PSD[] = {{B(PSD_SIG), B(PSD_SIG), 0}};
 static const Pattern P_MP3[] = {
-    {B("\x57\x41\x56\x45"), B("\x00\x00\xff")},
-    {B("\xff\xfb\xd0"), B("\xd1\x35\x51\xcc")},
+    {B("\x57\x41\x56\x45"), B("\x00\x00\xff"), 0},
+    {B("\xff\xfb\xd0"), B("\xd1\x35\x51\xcc"), 0},
 };
-static const Pattern P_WAV[] = {{B("\x52\x49\x46\x46"), B("\x4c\x65\x6f\x64")}};
+static const Pattern P_WAV[] = {{B("\x52\x49\x46\x46"), B("\x4c\x65\x6f\x64"), 0}};
 static const Pattern P_MP4[] = {{
     B("\x00\x00\x00\x20\x66\x74\x79\x70\x6d\x70\x34\x32"),
     B("\x5a\x5d\xe0\x82\x14\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xb4\xbc"),
+    0,
 }};
 
 #define FT(n, p, m) { n, p, sizeof(p) / sizeof((p)[0]), m }
@@ -318,19 +329,30 @@ static long deep_recover(const char *device, const char *outdir, const int *type
                 const Bytes *endp = &cur_pat->end;
                 const unsigned char *hit = find_bytes(w.p, w.len, endp->data, endp->len);
                 if (hit) {
-                    /* Thấy marker kết thúc: ghi mọi thứ từ p tới hết marker rồi đóng file */
-                    size_t cut = (size_t)(hit - w.p) + endp->len;
-                    fwrite(w.p, 1, cut, out);
-                    written += cut;
-                    out_name(path, sizeof path, outdir, prefix, file_id, cur_type->name);
-                    printf("Wrote file: %s\n", path);
-                    fclose(out);
-                    out = NULL;
-                    recovering = 0;
-                    file_id++;
-                    w.p += cut;
-                    w.len -= cut;
-                    progressed = 1;
+                    /* Thấy marker kết thúc: ghi mọi thứ từ p tới hết marker (+ end_extra byte theo sau) rồi đóng file */
+                    size_t before = (size_t)(hit - w.p);
+                    size_t cut = before + endp->len + cur_pat->end_extra;
+                    if (cut > w.len && got) {
+                        /* Phần end_extra chưa nạp đủ: ghi tới sát marker, dời p tới marker rồi chờ lần nạp sau
+                         * (chỉ còn < MAX_RESERVE byte trong buffer nên memmove vẫn an toàn) */
+                        fwrite(w.p, 1, before, out);
+                        written += before;
+                        w.p += before;
+                        w.len -= before;
+                    } else {
+                        if (cut > w.len) cut = w.len; /* hết dữ liệu: lấy hết những gì còn */
+                        fwrite(w.p, 1, cut, out);
+                        written += cut;
+                        out_name(path, sizeof path, outdir, prefix, file_id, cur_type->name);
+                        printf("Wrote file: %s\n", path);
+                        fclose(out);
+                        out = NULL;
+                        recovering = 0;
+                        file_id++;
+                        w.p += cut;
+                        w.len -= cut;
+                        progressed = 1;
+                    }
                 } else {
                     /* Chưa thấy marker. Phần "an toàn" để ghi ngay = tất cả trừ (độ dài end - 1) byte cuối,
                      * vì marker có thể đang nằm dở ở đuôi buffer và hoàn tất ở lần đọc sau. */
